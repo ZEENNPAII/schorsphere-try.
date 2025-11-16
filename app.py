@@ -430,8 +430,23 @@ def internal_error(error):
     # Try to render error page, fallback to simple message
     try:
         return render_template('errors/500.html'), 500
-    except:
-        return "Internal Server Error. Please check the logs.", 500
+    except Exception as e:
+        # If template rendering fails, return simple error message
+        return f"Internal Server Error. Please check the logs. Error: {str(e)}", 500
+
+# Add a simple health check endpoint for Vercel
+@app.route('/health')
+def health_check():
+    """Health check endpoint for Vercel"""
+    try:
+        db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+        return jsonify({
+            'status': 'ok',
+            'database_configured': bool(db_url and not db_url.startswith('sqlite')),
+            'database_url_set': bool(db_url)
+        }), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
