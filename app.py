@@ -195,7 +195,12 @@ class Schedule(db.Model):
 
 @login_manager.user_loader
 def load_user(user_id):
-    return db.session.get(User, int(user_id))
+    """Load user for Flask-Login"""
+    try:
+        return db.session.get(User, int(user_id))
+    except Exception as e:
+        print(f"Error loading user: {e}")
+        return None
 
 # Routes
 @app.route('/')
