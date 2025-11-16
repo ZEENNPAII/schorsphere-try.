@@ -324,39 +324,58 @@ app.register_blueprint(provider_bp, url_prefix='/provider')
 def init_database():
     """Initialize database tables - called on first request"""
     try:
+        db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+        # Skip if SQLite (local dev only)
+        if not db_url or db_url.startswith('sqlite'):
+            return
+        
         with app.app_context():
-            db.create_all()
-            # Create additional tables if they don't exist
             try:
-                db.session.execute(db.text("""
-                    CREATE TABLE IF NOT EXISTS application_remarks (
-                        id SERIAL PRIMARY KEY,
-                        application_id INTEGER NOT NULL REFERENCES scholarship_applications(id) ON DELETE CASCADE,
-                        provider_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                        remark_text TEXT NOT NULL,
-                        status VARCHAR(20) NOT NULL DEFAULT 'review',
-                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP
-                    )
-                """))
-                db.session.execute(db.text("""
-                    CREATE TABLE IF NOT EXISTS scholarship_application_files (
-                        id SERIAL PRIMARY KEY,
-                        application_id INTEGER NOT NULL REFERENCES scholarship_applications(id) ON DELETE CASCADE,
-                        credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
-                        requirement_type VARCHAR(100) NOT NULL,
-                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        UNIQUE(application_id, credential_id, requirement_type)
-                    )
-                """))
-                db.session.commit()
-            except Exception:
-                db.session.rollback()
+                # Test connection first
+                db.engine.connect().close()
+            except Exception as conn_err:
+                print(f"Database connection test failed: {conn_err}")
+                return
+            
+            # Create tables
+            db.create_all()
+            
+            # Create additional tables if they don't exist (only for PostgreSQL)
+            if 'postgresql' in db_url or 'postgres' in db_url:
+                try:
+                    db.session.execute(db.text("""
+                        CREATE TABLE IF NOT EXISTS application_remarks (
+                            id SERIAL PRIMARY KEY,
+                            application_id INTEGER NOT NULL REFERENCES scholarship_applications(id) ON DELETE CASCADE,
+                            provider_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            remark_text TEXT NOT NULL,
+                            status VARCHAR(20) NOT NULL DEFAULT 'review',
+                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP
+                        )
+                    """))
+                    db.session.execute(db.text("""
+                        CREATE TABLE IF NOT EXISTS scholarship_application_files (
+                            id SERIAL PRIMARY KEY,
+                            application_id INTEGER NOT NULL REFERENCES scholarship_applications(id) ON DELETE CASCADE,
+                            credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+                            requirement_type VARCHAR(100) NOT NULL,
+                            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            UNIQUE(application_id, credential_id, requirement_type)
+                        )
+                    """))
+                    db.session.commit()
+                except Exception as table_err:
+                    db.session.rollback()
+                    # Tables might already exist - that's okay
+                    pass
     except Exception as e:
+        # Don't crash on database errors
+        import traceback
         print(f"Database initialization error (non-fatal): {e}")
+        traceback.print_exc()
 
 # Initialize database on first request (Vercel-friendly)
-# Use before_request instead of deprecated before_first_request
 _database_initialized = False
 
 @app.before_request
@@ -367,8 +386,10 @@ def ensure_database_initialized():
             init_database()
             _database_initialized = True
         except Exception as e:
+            # Log error but don't crash the request
             print(f"Database initialization error: {e}")
-            # Don't fail the request, just log the error
+            import traceback
+            traceback.print_exc()
 
 # Custom Jinja2 filters
 @app.template_filter('safe_strftime')
