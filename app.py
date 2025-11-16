@@ -314,17 +314,26 @@ def logout():
     flash('You have been logged out successfully.', 'info')
     return redirect(url_for('index'))
 
-# Blueprint imports
-from auth.routes import auth_bp
-from admin.routes import admin_bp
-from students.routes import students_bp
-from provider.routes import provider_bp
-
-# Register blueprints
-app.register_blueprint(auth_bp, url_prefix='/auth')
-app.register_blueprint(admin_bp, url_prefix='/admin')
-app.register_blueprint(students_bp, url_prefix='/students')
-app.register_blueprint(provider_bp, url_prefix='/provider')
+# Blueprint imports - wrapped in try/except to prevent crashes
+try:
+    from auth.routes import auth_bp
+    from admin.routes import admin_bp
+    from students.routes import students_bp
+    from provider.routes import provider_bp
+    
+    # Register blueprints
+    app.register_blueprint(auth_bp, url_prefix='/auth')
+    app.register_blueprint(admin_bp, url_prefix='/admin')
+    app.register_blueprint(students_bp, url_prefix='/students')
+    app.register_blueprint(provider_bp, url_prefix='/provider')
+except Exception as e:
+    print(f"Error importing blueprints: {e}")
+    import traceback
+    traceback.print_exc()
+    # Create a simple error route if blueprints fail
+    @app.route('/error')
+    def blueprint_error():
+        return f"Error loading blueprints: {str(e)}", 500
 
 # Initialize database (lazy initialization for Vercel)
 def init_database():
@@ -429,16 +438,25 @@ def not_found(error):
 
 @app.errorhandler(500)
 def internal_error(error):
+    """Handle 500 errors with detailed information"""
+    import traceback
+    error_traceback = traceback.format_exc()
+    
     try:
         db.session.rollback()
     except:
         pass
-    # Try to render error page, fallback to simple message
+    
+    # Try to render error page, fallback to JSON with error details
     try:
         return render_template('errors/500.html'), 500
-    except Exception as e:
-        # If template rendering fails, return simple error message
-        return f"Internal Server Error. Please check the logs. Error: {str(e)}", 500
+    except:
+        # Return JSON with error details for debugging
+        return jsonify({
+            'error': 'Internal Server Error',
+            'message': str(error) if error else 'Unknown error',
+            'traceback': error_traceback
+        }), 500
 
 # Add a simple health check endpoint for Vercel
 @app.route('/health')
@@ -449,10 +467,26 @@ def health_check():
         return jsonify({
             'status': 'ok',
             'database_configured': bool(db_url and not db_url.startswith('sqlite')),
-            'database_url_set': bool(db_url)
+            'database_url_set': bool(db_url),
+            'app_loaded': True
         }), 200
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        import traceback
+        return jsonify({
+            'status': 'error', 
+            'message': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+# Add a simple test endpoint that doesn't require database
+@app.route('/test')
+def test_endpoint():
+    """Simple test endpoint - no database required"""
+    return jsonify({
+        'status': 'ok',
+        'message': 'App is running!',
+        'python_version': os.sys.version
+    }), 200
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
