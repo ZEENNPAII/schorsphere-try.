@@ -1,0 +1,301 @@
+# Complete Supabase Setup Guide for ScholarSphere
+
+This guide will walk you through setting up Supabase PostgreSQL database and connecting it to your Vercel application.
+
+---
+
+## 📋 Prerequisites
+
+- A Supabase account (free to create)
+- A Vercel account
+- Your ScholarSphere project deployed on Vercel
+
+---
+
+## Step 1: Create Supabase Account & Project
+
+### 1.1 Sign Up for Supabase
+
+1. Go to [supabase.com](https://supabase.com)
+2. Click **"Start your project"** or **"Sign Up"**
+3. Sign up with:
+   - GitHub (recommended - easiest)
+   - Email
+   - Google
+
+### 1.2 Create New Project
+
+1. After signing in, click **"New Project"**
+2. Fill in the project details:
+   - **Organization**: Select your organization (or create one)
+   - **Name**: `scholarsphere` (or any name you prefer)
+   - **Database Password**: 
+     - ⚠️ **IMPORTANT**: Create a STRONG password and **SAVE IT**!
+     - You'll need this password for the connection string
+     - Example: `MySecurePass123!@#`
+   - **Region**: 
+     - Choose the region closest to your users
+     - For Philippines: `Southeast Asia (Singapore)` or `Northeast Asia (Tokyo)`
+   - **Pricing Plan**: Select **"Free"** (sufficient for development)
+
+3. Click **"Create new project"**
+4. ⏳ **Wait 2-3 minutes** for the project to be created
+
+---
+
+## Step 2: Get Database Connection String
+
+### 2.1 Access Project Settings
+
+1. Once your project is ready, click on your project name
+2. Go to **"Settings"** (gear icon in the left sidebar)
+3. Click **"Database"** in the settings menu
+
+### 2.2 Get Connection String
+
+1. Scroll down to **"Connection string"** section
+2. You'll see different connection string formats
+3. Select **"URI"** tab
+4. Copy the connection string
+   - It looks like: 
+   ```
+   postgresql://postgres:[YOUR-PASSWORD]@db.xxxxx.supabase.co:5432/postgres
+   ```
+5. **Replace `[YOUR-PASSWORD]`** with the password you created in Step 1.2
+   - Example:
+   ```
+   postgresql://postgres:MySecurePass123!@#@db.abcdefghijklmnop.supabase.co:5432/postgres
+   ```
+6. **Copy the complete connection string** (with your password)
+
+---
+
+## Step 3: Create Database Tables
+
+You have **2 options** to create the tables:
+
+### Option A: Automatic (Recommended - Easiest)
+
+The app will automatically create tables when it runs. Just deploy and it works!
+
+### Option B: Manual Setup (If you want to set up now)
+
+1. In Supabase Dashboard, go to **"SQL Editor"** (left sidebar)
+2. Click **"New query"**
+3. Copy and paste the SQL from `create_supabase_tables.sql` (I'll create this file)
+4. Click **"Run"** (or press Ctrl+Enter)
+5. You should see "Success" message
+
+---
+
+## Step 4: Connect to Vercel
+
+### 4.1 Add Environment Variable to Vercel
+
+1. Go to [vercel.com](https://vercel.com)
+2. Select your **ScholarSphere project**
+3. Go to **"Settings"** → **"Environment Variables"**
+4. Click **"Add New"**
+
+5. Add the database connection:
+   - **Key**: `DATABASE_URL`
+   - **Value**: (paste the connection string from Step 2.2)
+   - **Environment**: 
+     - ✅ Check **Production**
+     - ✅ Check **Preview**
+     - ✅ Check **Development**
+   - Click **"Save"**
+
+6. Add SECRET_KEY (if not already set):
+   - **Key**: `SECRET_KEY`
+   - **Value**: (generate a random string - see below)
+   - **Environment**: Check all (Production, Preview, Development)
+   - Click **"Save"**
+
+**Generate SECRET_KEY:**
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Or use an online generator: [randomkeygen.com](https://randomkeygen.com/)
+
+### 4.2 Redeploy Your Application
+
+1. Go to **"Deployments"** tab in Vercel
+2. Click the **"..."** (three dots) on the latest deployment
+3. Click **"Redeploy"**
+4. Or simply **push a new commit** to GitHub (if connected)
+
+---
+
+## Step 5: Verify Connection
+
+### 5.1 Check Vercel Logs
+
+1. Go to your Vercel project → **"Deployments"**
+2. Click on the latest deployment
+3. Click **"Functions"** tab
+4. Look for any errors related to database connection
+
+### 5.2 Test Your Application
+
+1. Visit your Vercel app URL
+2. Try to **create an account**:
+   - Go to Sign Up page
+   - Fill in the form
+   - Submit
+   - Should work without errors!
+
+3. Try to **login**:
+   - Use the account you just created
+   - Or use default admin (if tables were created):
+     - Email: `admin@scholarsphere.com`
+     - Password: `admin123`
+
+### 5.3 Verify in Supabase
+
+1. Go back to Supabase Dashboard
+2. Click **"Table Editor"** (left sidebar)
+3. You should see tables:
+   - `users`
+   - `awards`
+   - `credentials`
+   - `scholarships`
+   - `scholarship_applications`
+   - `notifications`
+   - `schedule`
+   - `application_remarks`
+   - `scholarship_application_files`
+
+4. Click on `users` table to see if your test account was created
+
+---
+
+## Step 6: Create Default Admin User (Optional)
+
+If you want to create the admin user manually:
+
+1. Go to Supabase → **"SQL Editor"**
+2. Click **"New query"**
+3. Run this SQL (replace the password hash with one generated by Python):
+
+```sql
+-- First, generate password hash using Python:
+-- python -c "from werkzeug.security import generate_password_hash; print(generate_password_hash('admin123'))"
+
+-- Then insert admin user (replace HASH_HERE with the generated hash)
+INSERT INTO users (first_name, last_name, email, student_id, birthday, password_hash, role, is_active, created_at)
+VALUES (
+    'Admin',
+    'User',
+    'admin@scholarsphere.com',
+    '00000000',
+    '1990-01-01',
+    'pbkdf2:sha256:600000$...',  -- Replace with actual hash
+    'admin',
+    TRUE,
+    NOW()
+)
+ON CONFLICT (email) DO NOTHING;
+```
+
+**Or** the app will create it automatically on first run!
+
+---
+
+## 🔧 Troubleshooting
+
+### Error: "connection refused" or "timeout"
+
+**Solutions:**
+1. Check your connection string is correct
+2. Make sure you replaced `[YOUR-PASSWORD]` with your actual password
+3. Verify the connection string format is correct
+4. Check if your IP is allowed (Supabase allows all IPs by default on free tier)
+
+### Error: "relation does not exist" or "table does not exist"
+
+**Solutions:**
+1. Tables haven't been created yet
+2. The app creates them automatically on first run
+3. If it doesn't work, manually run the SQL script (see Step 3, Option B)
+4. Check Vercel logs for errors
+
+### Error: "SSL connection required"
+
+**Solutions:**
+1. Supabase requires SSL connections
+2. The connection string should include SSL parameters
+3. Make sure you're using the "URI" format connection string
+4. The app automatically handles SSL for PostgreSQL
+
+### Error: "password authentication failed"
+
+**Solutions:**
+1. Check if you replaced `[YOUR-PASSWORD]` in the connection string
+2. Verify your database password is correct
+3. If you forgot the password, you can reset it in Supabase Settings → Database
+
+### Error: "too many connections"
+
+**Solutions:**
+1. Free tier has connection limits
+2. The app uses connection pooling
+3. This shouldn't happen on free tier for normal usage
+4. If it does, consider upgrading or optimizing your queries
+
+---
+
+## 📊 Supabase Free Tier Limits
+
+- **Database Size**: 500 MB
+- **Bandwidth**: 2 GB/month
+- **API Requests**: Unlimited
+- **Database Connections**: Limited (but sufficient for development)
+- **File Storage**: 1 GB
+
+**For production**, you may need to upgrade, but free tier is perfect for development and testing!
+
+---
+
+## ✅ Checklist
+
+- [ ] Created Supabase account
+- [ ] Created new project
+- [ ] Saved database password securely
+- [ ] Got connection string from Supabase
+- [ ] Replaced `[YOUR-PASSWORD]` in connection string
+- [ ] Added `DATABASE_URL` to Vercel environment variables
+- [ ] Added `SECRET_KEY` to Vercel environment variables
+- [ ] Redeployed Vercel application
+- [ ] Tested account creation
+- [ ] Tested login
+- [ ] Verified tables in Supabase Table Editor
+
+---
+
+## 🎉 You're Done!
+
+Your ScholarSphere application is now connected to Supabase PostgreSQL database!
+
+**Next Steps:**
+1. Test all features (signup, login, password reset)
+2. Create test users
+3. Add scholarships
+4. Test the full application flow
+
+**Need Help?**
+- Check Vercel logs for errors
+- Check Supabase logs (Settings → Logs)
+- Verify environment variables are set correctly
+- Make sure connection string format is correct
+
+---
+
+## 🔗 Useful Links
+
+- [Supabase Dashboard](https://app.supabase.com)
+- [Supabase Documentation](https://supabase.com/docs)
+- [Vercel Dashboard](https://vercel.com/dashboard)
+- [Vercel Documentation](https://vercel.com/docs)
+

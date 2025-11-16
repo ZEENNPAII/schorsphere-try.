@@ -19,10 +19,12 @@ load_dotenv()
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-here')
 
-# Database configuration - supports SQLite (local) and PostgreSQL/MySQL (Vercel/cloud)
-database_url = os.environ.get('DATABASE_URL')
+# Database configuration - Vercel compatible
+# Vercel Postgres uses POSTGRES_URL, but we'll check DATABASE_URL first
+database_url = os.environ.get('DATABASE_URL') or os.environ.get('POSTGRES_URL')
+
 if not database_url:
-    # Default to SQLite for local development
+    # Default to SQLite for local development only
     database_url = 'sqlite:///scholarsphere.db'
 else:
     # Vercel/cloud databases often use postgres:// but SQLAlchemy needs postgresql://
@@ -33,7 +35,6 @@ app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Initialize extensions
-# Flask-SQLAlchemy automatically handles connection pooling for cloud databases
 db = SQLAlchemy(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
@@ -51,7 +52,7 @@ class User(UserMixin, db.Model):
     student_id = db.Column(db.String(8), unique=True)
     birthday = db.Column(db.Date)
     password_hash = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.Enum('student', 'provider', 'admin'), nullable=False, default='student')
+    role = db.Column(db.String(20), nullable=False, default='student')  # Changed from Enum for PostgreSQL compatibility
     profile_picture = db.Column(db.String(255), nullable=True)
     year_level = db.Column(db.String(20), nullable=True)  # 1st year, 2nd year, 3rd year, 4th year
     course = db.Column(db.String(50), nullable=True)  # BSIT, BSCS, BSCE, etc.
@@ -313,19 +314,61 @@ from admin.routes import admin_bp
 from students.routes import students_bp
 from provider.routes import provider_bp
 
-# Initialize database
-with app.app_context():
-    try:
-        db.create_all()
-        print("Database tables created successfully")
-    except Exception as e:
-        print(f"Database tables already exist or error: {e}")
-
 # Register blueprints
 app.register_blueprint(auth_bp, url_prefix='/auth')
 app.register_blueprint(admin_bp, url_prefix='/admin')
 app.register_blueprint(students_bp, url_prefix='/students')
 app.register_blueprint(provider_bp, url_prefix='/provider')
+
+# Initialize database (lazy initialization for Vercel)
+def init_database():
+    """Initialize database tables - called on first request"""
+    try:
+        with app.app_context():
+            db.create_all()
+            # Create additional tables if they don't exist
+            try:
+                db.session.execute(db.text("""
+                    CREATE TABLE IF NOT EXISTS application_remarks (
+                        id SERIAL PRIMARY KEY,
+                        application_id INTEGER NOT NULL REFERENCES scholarship_applications(id) ON DELETE CASCADE,
+                        provider_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        remark_text TEXT NOT NULL,
+                        status VARCHAR(20) NOT NULL DEFAULT 'review',
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP
+                    )
+                """))
+                db.session.execute(db.text("""
+                    CREATE TABLE IF NOT EXISTS scholarship_application_files (
+                        id SERIAL PRIMARY KEY,
+                        application_id INTEGER NOT NULL REFERENCES scholarship_applications(id) ON DELETE CASCADE,
+                        credential_id INTEGER NOT NULL REFERENCES credentials(id) ON DELETE CASCADE,
+                        requirement_type VARCHAR(100) NOT NULL,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(application_id, credential_id, requirement_type)
+                    )
+                """))
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+    except Exception as e:
+        print(f"Database initialization error (non-fatal): {e}")
+
+# Initialize database on first request (Vercel-friendly)
+# Use before_request instead of deprecated before_first_request
+_database_initialized = False
+
+@app.before_request
+def ensure_database_initialized():
+    global _database_initialized
+    if not _database_initialized:
+        try:
+            init_database()
+            _database_initialized = True
+        except Exception as e:
+            print(f"Database initialization error: {e}")
+            # Don't fail the request, just log the error
 
 # Custom Jinja2 filters
 @app.template_filter('safe_strftime')
@@ -359,8 +402,15 @@ def not_found(error):
 
 @app.errorhandler(500)
 def internal_error(error):
-    db.session.rollback()
-    return render_template('errors/500.html'), 500
+    try:
+        db.session.rollback()
+    except:
+        pass
+    # Try to render error page, fallback to simple message
+    try:
+        return render_template('errors/500.html'), 500
+    except:
+        return "Internal Server Error. Please check the logs.", 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
