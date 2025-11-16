@@ -400,16 +400,22 @@ _database_initialized = False
 
 @app.before_request
 def ensure_database_initialized():
+    """Ensure database is initialized before handling requests"""
     global _database_initialized
     if not _database_initialized:
         try:
-            init_database()
+            # Only initialize if we have a cloud database (not SQLite)
+            db_url = app.config.get('SQLALCHEMY_DATABASE_URI', '')
+            if db_url and not db_url.startswith('sqlite'):
+                init_database()
             _database_initialized = True
         except Exception as e:
             # Log error but don't crash the request
             print(f"Database initialization error: {e}")
             import traceback
             traceback.print_exc()
+            # Mark as initialized anyway to prevent retrying on every request
+            _database_initialized = True
 
 # Custom Jinja2 filters
 @app.template_filter('safe_strftime')
