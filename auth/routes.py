@@ -33,78 +33,24 @@ def login():
         # Check if identifier is student ID (8 digits) or email
         is_student_id = re.match(r'^\d{8}$', identifier)
         
-        # Import database and models using current_app context
-        from flask import current_app
-        from flask_sqlalchemy import SQLAlchemy
-        from flask_login import UserMixin
-        from werkzeug.security import check_password_hash
-        
-        # Get the database instance from the current app
-        db = current_app.extensions['sqlalchemy']
-        
-        # Define User class for this context
-        class User(UserMixin):
-            def __init__(self, **kwargs):
-                # Set attributes manually to avoid property conflicts
-                self.id = kwargs.get('id')
-                self.first_name = kwargs.get('first_name')
-                self.last_name = kwargs.get('last_name')
-                self.email = kwargs.get('email')
-                self.student_id = kwargs.get('student_id')
-                self.birthday = kwargs.get('birthday')
-                self.password_hash = kwargs.get('password_hash')
-                self.role = kwargs.get('role')
-                self.profile_picture = kwargs.get('profile_picture')
-                self.year_level = kwargs.get('year_level')
-                self.course = kwargs.get('course')
-                self.organization = kwargs.get('organization')
-                self.created_at = kwargs.get('created_at')
-                self.updated_at = kwargs.get('updated_at')
-                # Store is_active as _is_active to avoid conflict with UserMixin property
-                self._is_active = kwargs.get('is_active', True)
+        # Use SQLAlchemy ORM - import from app
+        try:
+            from app import db, User
             
-            @property
-            def is_active(self):
-                return self._is_active
-            
-            def check_password(self, password):
-                return check_password_hash(self.password_hash, password)
-            
-            def get_full_name(self):
-                return f"{self.first_name} {self.last_name}"
-        
-        if is_student_id:
-            result = db.session.execute(
-                db.text("SELECT * FROM users WHERE student_id = :student_id"),
-                {"student_id": identifier}
-            ).fetchone()
-        else:
-            # Case-insensitive email lookup
-            email_lookup = identifier.lower()
-            result = db.session.execute(
-                db.text("SELECT * FROM users WHERE LOWER(email) = :email"),
-                {"email": email_lookup}
-            ).fetchone()
-        
-        if result:
-            user = User(
-                id=result[0],
-                first_name=result[1],
-                last_name=result[2],
-                email=result[3],
-                student_id=result[4],
-                birthday=result[5],
-                password_hash=result[6],
-                role=result[7],
-                profile_picture=result[8],
-                year_level=result[9],
-                course=result[10],
-                organization=result[11],
-                created_at=result[12],
-                updated_at=result[13]
-            )
-        else:
-            user = None
+            # Query user using ORM
+            if is_student_id:
+                user = User.query.filter_by(student_id=identifier).first()
+            else:
+                # Case-insensitive email lookup
+                user = User.query.filter(User.email.ilike(identifier)).first()
+                
+        except Exception as e:
+            # If ORM fails, log error and return
+            import traceback
+            print(f"Database query error: {e}")
+            traceback.print_exc()
+            flash('Database connection error. Please try again later.', 'error')
+            return render_template('auth/login.html')
         
         if user and user.check_password(password):
             login_user(user)
@@ -158,51 +104,49 @@ def signup():
             flash('Password must be at least 8 characters.', 'error')
             return render_template('auth/signup.html')
         
-        # Check for existing user
-        from flask import current_app
-        from werkzeug.security import generate_password_hash
-        
-        db = current_app.extensions['sqlalchemy']
-        
-        existing_user = db.session.execute(
-            db.text("SELECT * FROM users WHERE LOWER(email) = :email OR student_id = :student_id"),
-            {"email": email.lower(), "student_id": student_id}
-        ).fetchone()
-        
-        if existing_user:
-            flash('An account with this email or student ID already exists.', 'error')
-            return render_template('auth/signup.html')
-        
-        # Create new user
+        # Check for existing user using SQLAlchemy ORM
         try:
-            # Hash the password
-            password_hash = generate_password_hash(password)
+            from app import db, User
             
-            # Insert new user into database
-            db.session.execute(
-                db.text("""
-                    INSERT INTO users (first_name, last_name, email, student_id, birthday, password_hash, role, created_at)
-                    VALUES (:first_name, :last_name, :email, :student_id, :birthday, :password_hash, :role, :created_at)
-                """),
-                {
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "email": email.lower(),
-                    "student_id": student_id,
-                    "birthday": datetime.strptime(birthday, '%Y-%m-%d').date(),
-                    "password_hash": password_hash,
-                    "role": 'student',
-                    "created_at": datetime.utcnow()
-                }
+            existing_user = User.query.filter(
+                (User.email.ilike(email)) | (User.student_id == student_id)
+            ).first()
+            
+            if existing_user:
+                flash('An account with this email or student ID already exists.', 'error')
+                return render_template('auth/signup.html')
+            
+            # Create new user using ORM
+            new_user = User(
+                first_name=first_name,
+                last_name=last_name,
+                email=email.lower(),
+                student_id=student_id,
+                birthday=datetime.strptime(birthday, '%Y-%m-%d').date(),
+                role='student',
+                is_active=True
             )
+            new_user.set_password(password)
+            
+            db.session.add(new_user)
             db.session.commit()
             
             flash('Account created successfully. Please sign in.', 'success')
             return redirect(url_for('auth.login'))
             
         except Exception as e:
-            db.session.rollback()
-            flash('Failed to create account. Please try again.', 'error')
+            # Rollback on error
+            try:
+                db.session.rollback()
+            except:
+                pass
+            
+            # Log error for debugging
+            import traceback
+            print(f"Error creating user: {e}")
+            traceback.print_exc()
+            
+            flash(f'Failed to create account: {str(e)}. Please try again.', 'error')
             return render_template('auth/signup.html')
     
     return render_template('auth/signup.html')
