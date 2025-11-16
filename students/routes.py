@@ -38,12 +38,6 @@ def dashboard():
         {"user_id": current_user.id}
     ).scalar()
     
-    # Count actual awards uploaded by the student
-    total_awards = db.session.execute(
-        db.text("SELECT COUNT(*) FROM awards WHERE user_id = :user_id AND is_active = 1"),
-        {"user_id": current_user.id}
-    ).scalar()
-    
     # Count actual scholarship applications
     total_applications = db.session.execute(
         db.text("SELECT COUNT(*) FROM scholarship_applications WHERE user_id = :user_id AND is_active = 1"),
@@ -56,21 +50,52 @@ def dashboard():
         {"user_id": current_user.id}
     ).scalar()
     
+    # Deadlines: nearest counts for current and next month
+    from datetime import date
+    today = date.today()
+    first_of_month = today.replace(day=1)
+    if first_of_month.month == 12:
+        first_next_month = first_of_month.replace(year=first_of_month.year + 1, month=1)
+    else:
+        first_next_month = first_of_month.replace(month=first_of_month.month + 1)
+    if first_next_month.month == 12:
+        first_after_next = first_next_month.replace(year=first_next_month.year + 1, month=1)
+    else:
+        first_after_next = first_next_month.replace(month=first_next_month.month + 1)
+
+    # Count scholarships with deadlines this month and next month
+    this_month_deadlines = db.session.execute(
+        db.text("""
+            SELECT COUNT(*) FROM scholarships
+            WHERE status IN ('active','approved') AND is_active = 1
+              AND deadline IS NOT NULL
+              AND DATE(deadline) >= :start AND DATE(deadline) < :end
+        """),
+        {"start": first_of_month.isoformat(), "end": first_next_month.isoformat()}
+    ).scalar() or 0
+
+    next_month_deadlines = db.session.execute(
+        db.text("""
+            SELECT COUNT(*) FROM scholarships
+            WHERE status IN ('active','approved') AND is_active = 1
+              AND deadline IS NOT NULL
+              AND DATE(deadline) >= :start AND DATE(deadline) < :end
+        """),
+        {"start": first_next_month.isoformat(), "end": first_after_next.isoformat()}
+    ).scalar() or 0
+
     dashboard_data = {
         'user': current_user,
         'credentials': {
             'total': total_credentials
-        },
-        'awards': {
-            'total': total_awards
         },
         'applications': {
             'total': total_applications,
             'approved': approved_applications
         },
         'deadlines': {
-            'this_month': 0,  # Will be implemented when deadlines system is added
-            'next_month': 0
+            'this_month': this_month_deadlines,
+            'next_month': next_month_deadlines
         }
     }
     
@@ -303,13 +328,25 @@ def scholarships():
             except:
                 deadline = None
         
+        # Convert requirements from short codes to descriptive names
+        requirements_raw = scholarship[6] or ''
+        requirements_display = []
+        if requirements_raw and requirements_raw != 'No specific requirements':
+            from credential_matcher import CredentialMatcher
+            req_codes = [req.strip() for req in requirements_raw.split(',') if req.strip()]
+            for req_code in req_codes:
+                if req_code in CredentialMatcher.REQUIREMENT_MAPPINGS:
+                    requirements_display.append(CredentialMatcher.REQUIREMENT_MAPPINGS[req_code][0])
+                else:
+                    requirements_display.append(req_code)  # Keep custom requirements as-is
+        
         scholarships_data.append({
             'id': scholarship[1] or f"SCH-{scholarship[0]:03d}",
             'title': scholarship[2],
             'description': scholarship[3] or 'No description available',
             'amount': scholarship[4] or 'Amount not specified',
             'deadline': deadline.strftime('%B %d, %Y') if deadline else 'No deadline',
-            'requirements': scholarship[6] or 'No specific requirements',
+            'requirements': ', '.join(requirements_display) if requirements_display else 'No specific requirements',
             'provider': scholarship[7] or 'University of Cebu',
             'scholarship_id': scholarship[0],
             'has_applied': (existing_application is not None and (existing_application[0] or '').lower() != 'rejected'),
@@ -322,25 +359,54 @@ def scholarships():
 @students_bp.route('/apply-scholarship/<int:scholarship_id>', methods=['POST'])
 @login_required
 def apply_scholarship(scholarship_id):
-    """Apply to a scholarship"""
+    """Apply to a scholarship with credential selection"""
     if current_user.role != 'student':
         return jsonify({'error': 'Access denied'}), 403
     
     try:
         from flask import current_app
         from datetime import datetime
+        import json
         db = current_app.extensions['sqlalchemy']
+        
+        # Get form data - handle both JSON and FormData
+        if request.is_json:
+            form_data = request.get_json()
+            selected_credentials = form_data.get('selected_credentials', {})
+        else:
+            # Handle form data
+            form_data = request.form.to_dict()
+            # Parse selected_credentials from JSON string if it exists
+            credentials_str = request.form.get('selected_credentials', '{}')
+            try:
+                selected_credentials = json.loads(credentials_str)
+            except (json.JSONDecodeError, ValueError):
+                selected_credentials = {}
         
         # Check if scholarship exists and is active
         scholarship = db.session.execute(
-            db.text("SELECT id, applications_count, pending_count FROM scholarships WHERE id = :id AND status IN ('active','approved') AND is_active = 1"),
+            db.text("SELECT id, applications_count, pending_count, requirements FROM scholarships WHERE id = :id AND status IN ('active','approved') AND is_active = 1"),
             {"id": scholarship_id}
         ).fetchone()
         
         if not scholarship:
             return jsonify({'success': False, 'message': 'Scholarship not found or not available'}), 404
         
-        # Check existing active application
+        # Block if student already has an approved active scholarship application
+        has_approved = db.session.execute(
+            db.text(
+                """
+                SELECT id FROM scholarship_applications
+                WHERE user_id = :user_id AND status = 'approved' AND is_active = 1
+                LIMIT 1
+                """
+            ),
+            {"user_id": current_user.id}
+        ).fetchone()
+        if has_approved:
+            return jsonify({'success': False, 'message': 'You already have an approved scholarship. Please contact your provider to revoke (soft delete) it before applying again.'}), 400
+        
+        # Check existing active application for this scholarship
         existing_application = db.session.execute(
             db.text(
                 """
@@ -366,7 +432,7 @@ def apply_scholarship(scholarship_id):
         
         # Create new application
         current_time = datetime.utcnow().isoformat()
-        db.session.execute(
+        result = db.session.execute(
             db.text("""
                 INSERT INTO scholarship_applications (user_id, scholarship_id, status, application_date, is_active)
                 VALUES (:user_id, :scholarship_id, :status, :application_date, :is_active)
@@ -379,6 +445,29 @@ def apply_scholarship(scholarship_id):
                 "is_active": 1
             }
         )
+        
+        application_id = result.lastrowid
+        
+        # Link selected credentials to the application (if any requirements exist)
+        if selected_credentials and len(selected_credentials) > 0:
+            for requirement, credential_id in selected_credentials.items():
+                if credential_id and credential_id != '':
+                    try:
+                        db.session.execute(
+                            db.text("""
+                                INSERT INTO scholarship_application_files (application_id, credential_id, requirement_type)
+                                VALUES (:application_id, :credential_id, :requirement_type)
+                            """),
+                            {
+                                "application_id": application_id,
+                                "credential_id": int(credential_id),
+                                "requirement_type": requirement
+                            }
+                        )
+                    except Exception as e:
+                        # Skip invalid credential selections
+                        print(f"Warning: Could not link credential {credential_id} for requirement {requirement}: {e}")
+                        continue
         
         # Update scholarship application count
         db.session.execute(
@@ -394,15 +483,119 @@ def apply_scholarship(scholarship_id):
         )
         
         db.session.commit()
+
+        # Create notification for application submission (raw SQL)
+        try:
+            db.session.execute(
+                db.text("""
+                    INSERT INTO notifications (user_id, type, title, message, created_at, is_active)
+                    VALUES (:user_id, :type, :title, :message, :created_at, 1)
+                """),
+                {
+                    "user_id": current_user.id,
+                    "type": 'application',
+                    "title": 'Application Submitted',
+                    "message": 'Your scholarship application has been submitted successfully.',
+                    "created_at": datetime.utcnow()
+                }
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
         
         return jsonify({
             'success': True,
-            'message': 'Application submitted successfully'
+            'message': 'Application submitted successfully with credentials'
         })
         
     except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'message': 'Failed to submit application'}), 500
+        if 'db' in locals():
+            db.session.rollback()
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error submitting application: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return jsonify({'success': False, 'message': f'Failed to submit application: {str(e)}'}), 500
+
+@students_bp.route('/api/scholarship/<int:scholarship_id>/credentials')
+@login_required
+def get_scholarship_credentials(scholarship_id):
+    """Get available credentials for a scholarship application"""
+    if current_user.role != 'student':
+        return jsonify({'error': 'Access denied'}), 403
+    
+    try:
+        from flask import current_app
+        from credential_matcher import CredentialMatcher
+        db = current_app.extensions['sqlalchemy']
+        
+        # Get scholarship requirements
+        scholarship = db.session.execute(
+            db.text("SELECT requirements FROM scholarships WHERE id = :id AND status IN ('active','approved') AND is_active = 1"),
+            {"id": scholarship_id}
+        ).fetchone()
+        
+        if not scholarship:
+            return jsonify({'success': False, 'message': 'Scholarship not found'}), 404
+        
+        requirements = (scholarship[0] or '').split(',')
+        requirements = [req.strip() for req in requirements if req.strip()]
+        
+        # Get student's available credentials
+        user_credentials = db.session.execute(
+            db.text("SELECT * FROM credentials WHERE user_id = :user_id AND is_active = 1 ORDER BY upload_date DESC"),
+            {"user_id": current_user.id}
+        ).fetchall()
+        
+        # Convert to list of dictionaries
+        credentials_list = []
+        for cred in user_credentials:
+            credentials_list.append({
+                'id': cred[0],
+                'user_id': cred[1],
+                'credential_type': cred[2],
+                'file_name': cred[3],
+                'file_path': cred[4],
+                'file_size': cred[5],
+                'status': cred[6],
+                'upload_date': cred[7],
+                'is_active': cred[8]
+            })
+        
+        # Use credential matcher to find matches
+        credential_matches = CredentialMatcher.find_matching_credentials(requirements, credentials_list)
+        
+        # Prepare response with requirement status
+        response_data = {
+            'requirements': [],
+            'available_credentials': credentials_list
+        }
+        
+        for requirement in requirements:
+            matches = credential_matches.get(requirement, [])
+            status, best_match = CredentialMatcher.get_requirement_status(requirement, credentials_list)
+            
+            # Convert short code to descriptive name for display
+            display_name = requirement
+            if requirement in CredentialMatcher.REQUIREMENT_MAPPINGS:
+                display_name = CredentialMatcher.REQUIREMENT_MAPPINGS[requirement][0]
+            
+            response_data['requirements'].append({
+                'requirement': display_name,  # Use descriptive name for display
+                'requirement_code': requirement,  # Keep original code for matching
+                'status': status,
+                'matches': matches,
+                'best_match': best_match,
+                'suggested_type': CredentialMatcher.suggest_credential_type(requirement)
+            })
+        
+        return jsonify({
+            'success': True,
+            'data': response_data
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'message': 'Failed to get credentials data'}), 500
 
 @students_bp.route('/withdraw-application/<int:application_id>', methods=['POST'])
 @login_required
@@ -448,6 +641,25 @@ def withdraw_application(application_id):
         )
         
         db.session.commit()
+
+        # Notify withdrawal (raw SQL)
+        try:
+            db.session.execute(
+                db.text("""
+                    INSERT INTO notifications (user_id, type, title, message, created_at, is_active)
+                    VALUES (:user_id, :type, :title, :message, :created_at, 1)
+                """),
+                {
+                    "user_id": current_user.id,
+                    "type": 'application',
+                    "title": 'Application Withdrawn',
+                    "message": 'You withdrew a scholarship application.',
+                    "created_at": datetime.utcnow()
+                }
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
         
         return jsonify({
             'success': True,
@@ -459,42 +671,184 @@ def withdraw_application(application_id):
         return jsonify({'success': False, 'message': 'Failed to withdraw application'}), 500
 
 # API endpoints for AJAX requests
+@students_bp.route('/api/application/<int:application_id>')
+@login_required
+def get_application_detail(application_id):
+    if current_user.role != 'student':
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        from flask import current_app
+        from datetime import datetime
+        db = current_app.extensions['sqlalchemy']
+        # Verify ownership and fetch
+        app_row = db.session.execute(
+            db.text("""
+                SELECT sa.id, sa.status, sa.application_date, s.title, s.code, s.deadline
+                FROM scholarship_applications sa
+                JOIN scholarships s ON sa.scholarship_id = s.id
+                WHERE sa.id=:id AND sa.user_id=:uid AND sa.is_active=1
+            """), {"id": application_id, "uid": current_user.id}
+        ).fetchone()
+        if not app_row:
+            return jsonify({'success': False, 'error': 'Application not found'}), 404
+        # Documents
+        docs = db.session.execute(
+            db.text("""
+                SELECT saf.requirement_type, c.file_name, c.file_path, c.credential_type
+                FROM scholarship_application_files saf
+                JOIN credentials c ON c.id = saf.credential_id
+                WHERE saf.application_id = :id
+                ORDER BY saf.requirement_type
+            """), {"id": application_id}
+        ).fetchall()
+        documents = [{"requirement_type": d[0], "file_name": d[1], "file_path": f"static/uploads/credentials/{d[2]}", "credential_type": d[3]} for d in docs]
+        # Remarks
+        try:
+            remarks = db.session.execute(
+                db.text("""
+                    SELECT ar.remark_text, ar.status, ar.created_at, u.first_name, u.last_name
+                    FROM application_remarks ar
+                    JOIN scholarship_applications sa ON sa.id = ar.application_id
+                    JOIN scholarships s ON sa.scholarship_id = s.id
+                    JOIN users u ON u.id = ar.provider_id
+                    WHERE ar.application_id = :id
+                    ORDER BY ar.created_at DESC
+                """), {"id": application_id}
+            ).fetchall()
+        except Exception:
+            remarks = []
+        remarks_list = [{"text": r[0], "status": (r[1] or '').title(), "date": (r[2] or ''), "provider": f"{r[3]} {r[4]}"} for r in remarks]
+        # Schedules
+        try:
+            # Prefer new schedule table
+            scheds = db.session.execute(
+                db.text("""
+                    SELECT schedule_date, schedule_time, location, notes, created_at
+                    FROM schedule
+                    WHERE application_id = :id
+                    ORDER BY created_at DESC
+                """), {"id": application_id}
+            ).fetchall()
+        except Exception:
+            # Fallback to legacy table if present
+            try:
+                scheds = db.session.execute(
+                    db.text("""
+                        SELECT schedule_date, schedule_time, location, notes, created_at
+                        FROM scholarship_application_schedules
+                        WHERE application_id = :id
+                        ORDER BY created_at DESC
+                    """), {"id": application_id}
+                ).fetchall()
+            except Exception:
+                scheds = []
+        schedules = [{"date": s[0], "time": s[1], "location": s[2], "notes": s[3], "created_at": s[4]} for s in scheds]
+        # Format
+        from datetime import datetime as dt
+        app_date = app_row[2]
+        try:
+            app_date_fmt = dt.fromisoformat(app_date.replace('Z','+00:00')).strftime('%B %d, %Y') if app_date else ''
+        except Exception:
+            app_date_fmt = app_date or ''
+        deadline = app_row[5]
+        try:
+            deadline_fmt = dt.fromisoformat(deadline.replace('Z','+00:00')).strftime('%B %d, %Y') if deadline else 'No deadline'
+        except Exception:
+            deadline_fmt = deadline or 'No deadline'
+        payload = {
+            'id': app_row[0],
+            'status': (app_row[1] or 'pending').title(),
+            'date_applied': app_date_fmt,
+            'scholarship_title': app_row[3],
+            'scholarship_code': app_row[4],
+            'deadline': deadline_fmt,
+            'documents': documents,
+            'remarks': remarks_list,
+            'schedules': schedules
+        }
+        return jsonify({'success': True, 'application': payload})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @students_bp.route('/api/notifications')
 @login_required
 def get_notifications():
     """Get student notifications"""
     if current_user.role != 'student':
         return jsonify({'error': 'Access denied'}), 403
-    
-    # Mock notifications data
-    notifications = [
-        {
-            'id': 1,
-            'type': 'approved',
-            'title': 'Scholarship Approved! 🎉',
-            'message': 'Congratulations! Your Academic Excellence Scholarship application has been approved.',
-            'time': '2 hours ago',
-            'unread': True
-        },
-        {
-            'id': 2,
-            'type': 'schedule',
-            'title': 'Interview Scheduled 📅',
-            'message': 'Your interview for the Leadership Scholarship has been scheduled for March 20, 2024.',
-            'time': '1 day ago',
-            'unread': True
-        },
-        {
-            'id': 3,
-            'type': 'update',
-            'title': 'Application Update Required 📝',
-            'message': 'Your Computer Science Excellence application needs additional documents.',
-            'time': '3 days ago',
-            'unread': True
-        }
-    ]
-    
-    return jsonify(notifications)
+
+    try:
+        from flask import current_app
+        db = current_app.extensions['sqlalchemy']
+        rows = db.session.execute(
+            db.text("""
+                SELECT id, user_id, type, title, message, created_at, read_at
+                FROM notifications
+                WHERE user_id = :uid AND is_active = 1
+                ORDER BY created_at DESC
+                LIMIT 50
+            """),
+            {"uid": current_user.id}
+        ).fetchall()
+
+        def humanize(dt):
+            from datetime import datetime
+            if not dt:
+                return ''
+            now = datetime.utcnow()
+            diff = now - (dt if not isinstance(dt, str) else datetime.fromisoformat(dt.replace('Z','+00:00')))
+            s = int(diff.total_seconds())
+            if s < 60:
+                return f"{s}s ago"
+            m = s // 60
+            if m < 60:
+                return f"{m}m ago"
+            h = m // 60
+            if h < 24:
+                return f"{h}h ago"
+            d = h // 24
+            return f"{d}d ago"
+
+        notifications = []
+        for n in rows:
+            nid, _, ntype, ntitle, nmsg, ncreated, nread = n
+            notifications.append({
+                'id': nid,
+                'type': ntype,
+                'title': ntitle,
+                'message': nmsg,
+                'time': humanize(ncreated),
+                'unread': (nread is None)
+            })
+
+        unread_count = sum(1 for n in notifications if n['unread'])
+        return jsonify({'success': True, 'items': notifications, 'unread_count': unread_count})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@students_bp.route('/api/notifications/mark-read', methods=['POST'])
+@login_required
+def mark_notifications_read():
+    """Mark notifications as read (all or specific ids)"""
+    if current_user.role != 'student':
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        from flask import current_app
+        db = current_app.extensions['sqlalchemy']
+        data = request.get_json() or {}
+        ids = data.get('ids')
+        from datetime import datetime
+        # For simplicity, mark all current user's notifications as read
+        db.session.execute(
+            db.text("UPDATE notifications SET read_at = :ts WHERE user_id = :uid AND is_active = 1 AND read_at IS NULL"),
+            {"ts": datetime.utcnow(), "uid": current_user.id}
+        )
+        db.session.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        if 'db' in locals():
+            db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @students_bp.route('/api/add-award', methods=['POST'])
@@ -536,19 +890,36 @@ def upload_photo():
         file_extension = filename.rsplit('.', 1)[1].lower()
         unique_filename = f"{uuid.uuid4()}_{current_user.id}.{file_extension}"
         
-        # Create upload directory if it doesn't exist
-        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        # Create upload directory if it doesn't exist (absolute path)
+        from flask import current_app
+        base_dir = os.path.join(current_app.root_path, UPLOAD_FOLDER)
+        os.makedirs(base_dir, exist_ok=True)
         
         # Save file
-        file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+        file_path = os.path.join(base_dir, unique_filename)
         file.save(file_path)
         
-        # Update user profile picture in database
-        from app import db
-        current_user.profile_picture = unique_filename
-        current_user.updated_at = datetime.utcnow()
-        
+        # Update user profile picture in database (raw SQL)
         try:
+            db = current_app.extensions['sqlalchemy']
+            db.session.execute(
+                db.text("UPDATE users SET profile_picture = :pp, updated_at = :ts WHERE id = :id"),
+                {"pp": unique_filename, "ts": datetime.utcnow(), "id": current_user.id}
+            )
+            # Notify photo update
+            db.session.execute(
+                db.text("""
+                    INSERT INTO notifications (user_id, type, title, message, created_at, is_active)
+                    VALUES (:user_id, :type, :title, :message, :created_at, 1)
+                """),
+                {
+                    "user_id": current_user.id,
+                    "type": 'profile',
+                    "title": 'Profile Photo Updated',
+                    "message": 'Your profile photo has been updated.',
+                    "created_at": datetime.utcnow()
+                }
+            )
             db.session.commit()
             
             # Return success response with image URL
@@ -560,7 +931,8 @@ def upload_photo():
             })
             
         except Exception as e:
-            db.session.rollback()
+            if 'db' in locals():
+                db.session.rollback()
             # Delete the uploaded file if database update fails
             if os.path.exists(file_path):
                 os.remove(file_path)
@@ -594,13 +966,14 @@ def update_profile():
             return jsonify({'success': False, 'message': 'Invalid email address'}), 400
         
         # Check if email is already taken by another user
-        from app import db, User
-        existing_user = User.query.filter(
-            User.email == email,
-            User.id != current_user.id
-        ).first()
+        from flask import current_app
+        db = current_app.extensions['sqlalchemy']
+        row = db.session.execute(
+            db.text("SELECT id FROM users WHERE LOWER(email) = :email AND id != :id"),
+            {"email": email.lower(), "id": current_user.id}
+        ).fetchone()
         
-        if existing_user:
+        if row:
             return jsonify({'success': False, 'message': 'Email already taken by another user'}), 400
         
         # Handle photo upload if provided
@@ -612,24 +985,50 @@ def update_profile():
                 file_extension = filename.rsplit('.', 1)[1].lower()
                 unique_filename = f"{uuid.uuid4()}_{current_user.id}.{file_extension}"
                 
-                # Create upload directory if it doesn't exist
-                os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+                # Create upload directory if it doesn't exist (absolute path)
+                from flask import current_app
+                base_dir = os.path.join(current_app.root_path, UPLOAD_FOLDER)
+                os.makedirs(base_dir, exist_ok=True)
                 
                 # Save file
-                file_path = os.path.join(UPLOAD_FOLDER, unique_filename)
+                file_path = os.path.join(base_dir, unique_filename)
                 file.save(file_path)
                 
                 # Update profile picture
                 current_user.profile_picture = unique_filename
         
         # Update user information
-        current_user.first_name = first_name
-        current_user.last_name = last_name
-        current_user.email = email
-        current_user.birthday = datetime.strptime(birthday, '%Y-%m-%d').date()
-        current_user.year_level = year_level
-        current_user.course = course
-        current_user.updated_at = datetime.utcnow()
+        db.session.execute(
+            db.text("""
+                UPDATE users SET first_name=:fn, last_name=:ln, email=:em, birthday=:bd, year_level=:yl, course=:cr, updated_at=:ts
+                WHERE id = :id
+            """),
+            {
+                "fn": first_name,
+                "ln": last_name,
+                "em": email,
+                "bd": datetime.strptime(birthday, '%Y-%m-%d').date(),
+                "yl": year_level,
+                "cr": course,
+                "ts": datetime.utcnow(),
+                "id": current_user.id
+            }
+        )
+
+        # Notify profile update
+        db.session.execute(
+            db.text("""
+                INSERT INTO notifications (user_id, type, title, message, created_at, is_active)
+                VALUES (:user_id, :type, :title, :message, :created_at, 1)
+            """),
+            {
+                "user_id": current_user.id,
+                "type": 'profile',
+                "title": 'Profile Updated',
+                "message": 'Your profile information has been updated.',
+                "created_at": datetime.utcnow()
+            }
+        )
         
         db.session.commit()
         
@@ -667,41 +1066,69 @@ def upload_student_credential():
             file_extension = filename.rsplit('.', 1)[1].lower()
             unique_filename = f"{uuid.uuid4()}_{current_user.id}.{file_extension}"
             
-            # Create upload directory if it doesn't exist
-            os.makedirs(CREDENTIALS_FOLDER, exist_ok=True)
+            # Create upload directory if it doesn't exist (absolute path)
+            from flask import current_app
+            base_dir = os.path.join(current_app.root_path, CREDENTIALS_FOLDER)
+            os.makedirs(base_dir, exist_ok=True)
             
             # Save file
-            file_path = os.path.join(CREDENTIALS_FOLDER, unique_filename)
+            file_path = os.path.join(base_dir, unique_filename)
             file.save(file_path)
             
             # Get file size
             file_size = os.path.getsize(file_path)
             
-            # Save credential to database
-            from app import db, Credential
-            new_credential = Credential(
-                user_id=current_user.id,
-                credential_type=credential_type,
-                file_name=filename,
-                file_path=unique_filename,
-                file_size=file_size,
-                upload_date=datetime.utcnow()
+            # Save credential to database (raw SQL)
+            db = current_app.extensions['sqlalchemy']
+            res = db.session.execute(
+                db.text("""
+                    INSERT INTO credentials (user_id, credential_type, file_name, file_path, file_size, status, upload_date, is_active)
+                    VALUES (:user_id, :ctype, :fname, :fpath, :fsize, 'uploaded', :udate, 1)
+                """),
+                {
+                    "user_id": current_user.id,
+                    "ctype": credential_type,
+                    "fname": filename,
+                    "fpath": unique_filename,
+                    "fsize": file_size,
+                    "udate": datetime.utcnow()
+                }
             )
-            
-            db.session.add(new_credential)
+            cred_id = res.lastrowid if hasattr(res, 'lastrowid') else None
+
+            # Notify credential upload
+            db.session.execute(
+                db.text("""
+                    INSERT INTO notifications (user_id, type, title, message, created_at, is_active)
+                    VALUES (:user_id, :type, :title, :message, :created_at, 1)
+                """),
+                {
+                    "user_id": current_user.id,
+                    "type": 'credential',
+                    "title": 'Credential Uploaded',
+                    "message": f'{credential_type} uploaded successfully.',
+                    "created_at": datetime.utcnow()
+                }
+            )
             db.session.commit()
             
             return jsonify({
                 'success': True,
-                'message': 'Credential uploaded successfully'
+                'message': 'Credential uploaded successfully',
+                'credential_id': cred_id
             })
             
         else:
             return jsonify({'success': False, 'message': 'Invalid file type'}), 400
             
     except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'message': 'Failed to upload credential'}), 500
+        if 'db' in locals():
+            db.session.rollback()
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error uploading credential: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return jsonify({'success': False, 'message': f'Failed to upload credential: {str(e)}'}), 500
 
 @students_bp.route('/view-credential/<int:credential_id>')
 @login_required
@@ -711,25 +1138,25 @@ def view_credential(credential_id):
         flash('Access denied. Student access required.', 'error')
         return redirect(url_for('index'))
     
-    from app import db, Credential
-    credential = Credential.query.filter_by(
-        id=credential_id,
-        user_id=current_user.id,
-        is_active=True
-    ).first()
+    from flask import current_app
+    db = current_app.extensions['sqlalchemy']
+    row = db.session.execute(
+        db.text("SELECT file_path FROM credentials WHERE id = :id AND user_id = :uid AND is_active = 1"),
+        {"id": credential_id, "uid": current_user.id}
+    ).fetchone()
     
-    if not credential:
+    if not row:
         flash('Credential not found.', 'error')
         return redirect(url_for('students.credentials'))
     
-    file_path = os.path.join(CREDENTIALS_FOLDER, credential.file_path)
+    file_path = os.path.join(current_app.root_path, CREDENTIALS_FOLDER, row[0])
     
     if not os.path.exists(file_path):
         flash('File not found.', 'error')
         return redirect(url_for('students.credentials'))
     
     # Determine content type based on file extension
-    file_extension = credential.file_path.rsplit('.', 1)[1].lower()
+    file_extension = row[0].rsplit('.', 1)[1].lower()
     content_type_map = {
         'pdf': 'application/pdf',
         'jpg': 'image/jpeg',
@@ -771,31 +1198,52 @@ def upload_award():
             file_extension = filename.rsplit('.', 1)[1].lower()
             unique_filename = f"{uuid.uuid4()}_{current_user.id}.{file_extension}"
             
-            # Create upload directory if it doesn't exist
-            os.makedirs(AWARDS_FOLDER, exist_ok=True)
+            # Create upload directory if it doesn't exist (absolute path)
+            from flask import current_app
+            base_dir = os.path.join(current_app.root_path, AWARDS_FOLDER)
+            os.makedirs(base_dir, exist_ok=True)
             
             # Save file
-            file_path = os.path.join(AWARDS_FOLDER, unique_filename)
+            file_path = os.path.join(base_dir, unique_filename)
             file.save(file_path)
             
             # Get file size
             file_size = os.path.getsize(file_path)
             
-            # Save award to database
-            from app import db, Award
-            new_award = Award(
-                user_id=current_user.id,
-                award_type=award_type,
-                award_title=award_title,
-                academic_year=academic_year,
-                award_date=datetime.strptime(award_date, '%Y-%m-%d').date(),
-                file_name=filename,
-                file_path=unique_filename,
-                file_size=file_size,
-                upload_date=datetime.utcnow()
+            # Save award to database (raw SQL)
+            db = current_app.extensions['sqlalchemy']
+            db.session.execute(
+                db.text("""
+                    INSERT INTO awards (user_id, award_type, award_title, file_name, file_path, file_size, academic_year, award_date, upload_date, is_active)
+                    VALUES (:user_id, :atype, :atitle, :fname, :fpath, :fsize, :ayear, :adate, :udate, 1)
+                """),
+                {
+                    "user_id": current_user.id,
+                    "atype": award_type,
+                    "atitle": award_title,
+                    "fname": filename,
+                    "fpath": unique_filename,
+                    "fsize": file_size,
+                    "ayear": academic_year,
+                    "adate": datetime.strptime(award_date, '%Y-%m-%d').date(),
+                    "udate": datetime.utcnow()
+                }
             )
-            
-            db.session.add(new_award)
+
+            # Notify award upload
+            db.session.execute(
+                db.text("""
+                    INSERT INTO notifications (user_id, type, title, message, created_at, is_active)
+                    VALUES (:user_id, :type, :title, :message, :created_at, 1)
+                """),
+                {
+                    "user_id": current_user.id,
+                    "type": 'award',
+                    "title": 'Award Uploaded',
+                    "message": f'Award "{award_title}" has been uploaded.',
+                    "created_at": datetime.utcnow()
+                }
+            )
             db.session.commit()
             
             return jsonify({
@@ -820,25 +1268,25 @@ def view_award(award_id):
         flash('Access denied. Student access required.', 'error')
         return redirect(url_for('index'))
     
-    from app import db, Award
-    award = Award.query.filter_by(
-        id=award_id,
-        user_id=current_user.id,
-        is_active=True
-    ).first()
+    from flask import current_app
+    db = current_app.extensions['sqlalchemy']
+    row = db.session.execute(
+        db.text("SELECT file_path FROM awards WHERE id = :id AND user_id = :uid AND is_active = 1"),
+        {"id": award_id, "uid": current_user.id}
+    ).fetchone()
     
-    if not award:
+    if not row:
         flash('Award not found.', 'error')
         return redirect(url_for('students.awards'))
     
-    file_path = os.path.join(AWARDS_FOLDER, award.file_path)
+    file_path = os.path.join(current_app.root_path, AWARDS_FOLDER, row[0])
     
     if not os.path.exists(file_path):
         flash('File not found.', 'error')
         return redirect(url_for('students.awards'))
     
     # Determine content type based on file extension
-    file_extension = award.file_path.rsplit('.', 1)[1].lower()
+    file_extension = row[0].rsplit('.', 1)[1].lower()
     content_type_map = {
         'pdf': 'application/pdf',
         'jpg': 'image/jpeg',
@@ -854,6 +1302,36 @@ def view_award(award_id):
     from flask import send_file
     return send_file(file_path, as_attachment=False, mimetype=content_type)
 
+@students_bp.route('/delete-credential/<int:credential_id>', methods=['DELETE'])
+@login_required
+def delete_credential(credential_id):
+    """Delete credential (soft delete + remove file)"""
+    if current_user.role != 'student':
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        from flask import current_app
+        db = current_app.extensions['sqlalchemy']
+        row = db.session.execute(
+            db.text("SELECT file_path FROM credentials WHERE id = :id AND user_id = :uid AND is_active = 1"),
+            {"id": credential_id, "uid": current_user.id}
+        ).fetchone()
+        if not row:
+            return jsonify({'success': False, 'message': 'Credential not found'}), 404
+        # Delete file
+        file_path = os.path.join(current_app.root_path, CREDENTIALS_FOLDER, row[0])
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        # Soft delete
+        db.session.execute(
+            db.text("UPDATE credentials SET is_active = 0 WHERE id = :id"),
+            {"id": credential_id}
+        )
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Credential deleted successfully'})
+    except Exception:
+        db.session.rollback()
+        return jsonify({'success': False, 'message': 'Failed to delete credential'}), 500
+
 @students_bp.route('/delete-award/<int:award_id>', methods=['DELETE'])
 @login_required
 def delete_award(award_id):
@@ -862,23 +1340,25 @@ def delete_award(award_id):
         return jsonify({'error': 'Access denied'}), 403
     
     try:
-        from app import db, Award
-        award = Award.query.filter_by(
-            id=award_id,
-            user_id=current_user.id,
-            is_active=True
-        ).first()
-        
-        if not award:
+        from flask import current_app
+        db = current_app.extensions['sqlalchemy']
+        row = db.session.execute(
+            db.text("SELECT file_path FROM awards WHERE id=:id AND user_id=:uid AND is_active=1"),
+            {"id": award_id, "uid": current_user.id}
+        ).fetchone()
+        if not row:
             return jsonify({'success': False, 'message': 'Award not found'}), 404
         
         # Delete file from filesystem
-        file_path = os.path.join(AWARDS_FOLDER, award.file_path)
+        file_path = os.path.join(current_app.root_path, AWARDS_FOLDER, row[0])
         if os.path.exists(file_path):
             os.remove(file_path)
         
         # Mark as inactive in database (soft delete)
-        award.is_active = False
+        db.session.execute(
+            db.text("UPDATE awards SET is_active = 0 WHERE id = :id"),
+            {"id": award_id}
+        )
         db.session.commit()
         
         return jsonify({

@@ -36,14 +36,20 @@ def dashboard():
     accepted_applications = 0
     pending_applications = 0
     try:
-        cursor.execute("SELECT COUNT(*) FROM scholarships")
+        cursor.execute("SELECT COUNT(*) FROM scholarships WHERE COALESCE(is_active, 1) = 1")
         created_scholarships = cursor.fetchone()[0] or 0
     except Exception:
         created_scholarships = 0
-    # Pending scholarships metric removed from dashboard UI
+    
+    # Get real application counts from scholarship_applications table
     try:
-        # Aggregate application status columns if present on scholarships
-        cursor.execute("SELECT IFNULL(SUM(approved_count),0), IFNULL(SUM(pending_count),0) FROM scholarships")
+        cursor.execute("""
+            SELECT 
+                SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved_count,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_count
+            FROM scholarship_applications 
+            WHERE COALESCE(is_active, 1) = 1
+        """)
         row = cursor.fetchone() or (0, 0)
         accepted_applications = row[0] or 0
         pending_applications = row[1] or 0
@@ -226,9 +232,18 @@ def scholarships():
 
     cursor.execute(
         """
-        SELECT s.id, s.code, s.title, s.deadline, s.created_at, s.applications_count, s.status, u.organization
+        SELECT s.id, s.code, s.title, s.deadline, s.created_at, 
+               COALESCE(app_counts.app_count, 0) as applications_count, 
+               s.status, u.organization
         FROM scholarships s
         LEFT JOIN users u ON u.id = s.provider_id
+        LEFT JOIN (
+            SELECT scholarship_id, COUNT(*) as app_count 
+            FROM scholarship_applications 
+            WHERE COALESCE(is_active, 1) = 1
+            GROUP BY scholarship_id
+        ) app_counts ON app_counts.scholarship_id = s.id
+        WHERE COALESCE(s.is_active, 1) = 1
         ORDER BY s.id ASC
         """
     )
@@ -281,70 +296,83 @@ def applications():
 @admin_bp.route('/reports')
 @login_required
 def reports():
-    """Reports and analytics page"""
+    """Reports and analytics page (real data)"""
     if current_user.role != 'admin':
         flash('Access denied. Admin access required.', 'error')
         return redirect(url_for('index'))
-    import sqlite3
-    import os
-    db_path = os.path.join(current_app.instance_path, 'scholarsphere.db')
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
 
-    # Total students
-    cursor.execute("SELECT COUNT(*) FROM users WHERE role='student'")
-    total_students = cursor.fetchone()[0] or 0
-
-    # Total applications aggregated from scholarships table (fallback 0 if not exists)
-    total_applications = 0
-    pending = approved = disapproved = 0
+    # Use SQLAlchemy session from current_app for consistency
     try:
-        cursor.execute("SELECT SUM(applications_count), SUM(pending_count), SUM(approved_count), SUM(disapproved_count) FROM scholarships")
-        row = cursor.fetchone()
-        total_applications = (row[0] or 0)
-        pending = (row[1] or 0)
-        approved = (row[2] or 0)
-        disapproved = (row[3] or 0)
-    except Exception:
-        total_applications = 0
+        from flask import current_app
+        db = current_app.extensions['sqlalchemy']
 
-    # Breakdown by provider (top providers)
-    top_providers = []
-    try:
-        cursor.execute(
-            """
-            SELECT IFNULL(u.organization,'—') as org, COUNT(s.id) as num_sch, IFNULL(SUM(s.applications_count),0) as apps
-            FROM scholarships s
-            LEFT JOIN users u ON u.id = s.provider_id
-            GROUP BY org
-            ORDER BY apps DESC
-            LIMIT 5
-            """
-        )
-        top_providers = [{'name': r[0], 'scholarships': r[1], 'applications': r[2]} for r in cursor.fetchall()]
-    except Exception:
-        top_providers = []
+        # Total active students (match portal definition of active users)
+        total_students = db.session.execute(
+            db.text("SELECT COUNT(*) FROM users WHERE role='student' AND COALESCE(is_active,1) = 1")
+        ).scalar() or 0
 
-    conn.close()
+        # Status counts from scholarship_applications table (active records only)
+        status_row = db.session.execute(
+            db.text("""
+                SELECT 
+                  SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                  SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) AS approved,
+                  SUM(CASE WHEN status='rejected' THEN 1 ELSE 0 END) AS disapproved,
+                  COUNT(*) AS total
+                FROM scholarship_applications
+                WHERE COALESCE(is_active,1) = 1
+            """)
+        ).fetchone() or (0,0,0,0)
+        pending = int(status_row[0] or 0)
+        approved = int(status_row[1] or 0)
+        disapproved = int(status_row[2] or 0)
+        total_applications = int(status_row[3] or 0)
 
-    # Percent of students who applied online (approx via applications_count)
-    applied_percent = round((total_applications / total_students) * 100, 2) if total_students else 0.0
+        # Breakdown by provider (top providers by active applications)
+        rows = db.session.execute(
+            db.text(
+                """
+                SELECT IFNULL(NULLIF(TRIM(u.organization),''),'—') as org, COUNT(sa.id) as apps
+                FROM scholarship_applications sa
+                JOIN scholarships s ON sa.scholarship_id = s.id
+                LEFT JOIN users u ON u.id = s.provider_id
+                WHERE COALESCE(sa.is_active,1) = 1
+                GROUP BY org
+                ORDER BY apps DESC, org ASC
+                LIMIT 5
+                """
+            )
+        ).fetchall()
+        top_providers = [{'name': r[0], 'applications': int(r[1] or 0), 'scholarships': None} for r in rows]
 
-    data = {
-        'totals': {
-            'total_students': total_students,
-            'total_applications': total_applications,
-            'applied_percent': applied_percent
-        },
-        'top_providers': top_providers,
-        'status_counts': {
-            'pending': pending,
-            'approved': approved,
-            'disapproved': disapproved
+        # Percent of active students who have at least one active application
+        if total_students:
+            applicants_row = db.session.execute(
+                db.text("SELECT COUNT(DISTINCT user_id) FROM scholarship_applications WHERE COALESCE(is_active,1) = 1")
+            ).fetchone()
+            applicants = int(applicants_row[0] or 0)
+            applied_percent = round((applicants / total_students) * 100, 2)
+        else:
+            applied_percent = 0.0
+
+        data = {
+            'totals': {
+                'total_students': total_students,
+                'total_applications': total_applications,
+                'applied_percent': applied_percent
+            },
+            'top_providers': top_providers,
+            'status_counts': {
+                'pending': pending,
+                'approved': approved,
+                'disapproved': disapproved
+            }
         }
-    }
-
-    return render_template('admin/reports.html', data=data)
+        return render_template('admin/reports.html', data=data)
+    except Exception as e:
+        # Fallback to existing behavior if needed
+        flash('Failed to load reports data', 'error')
+        return render_template('admin/reports.html', data={'totals': {'total_students':0,'total_applications':0,'applied_percent':0}, 'top_providers': [], 'status_counts': {'pending':0,'approved':0,'disapproved':0}})
 
 # API endpoints for admin functions
 @admin_bp.route('/api/create-user', methods=['POST'])
@@ -614,13 +642,20 @@ def get_stats():
         accepted_applications = 0
         pending_applications = 0
         try:
-            cursor.execute("SELECT COUNT(*) FROM scholarships")
+            cursor.execute("SELECT COUNT(*) FROM scholarships WHERE COALESCE(is_active, 1) = 1")
             created_scholarships = cursor.fetchone()[0] or 0
         except Exception:
             created_scholarships = 0
-        # Pending scholarships metric removed from dashboard UI
+        
+        # Get real application counts from scholarship_applications table
         try:
-            cursor.execute("SELECT IFNULL(SUM(approved_count),0), IFNULL(SUM(pending_count),0) FROM scholarships")
+            cursor.execute("""
+                SELECT 
+                    SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved_count,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_count
+                FROM scholarship_applications 
+                WHERE COALESCE(is_active, 1) = 1
+            """)
             row = cursor.fetchone() or (0, 0)
             accepted_applications = row[0] or 0
             pending_applications = row[1] or 0
@@ -682,6 +717,36 @@ def update_scholarship_status(scholarship_id):
     conn.commit()
     conn.close()
     return jsonify({'success': True})
+
+@admin_bp.route('/api/cleanup-mock', methods=['POST'])
+@login_required
+def cleanup_mock_scholarships():
+    """Remove known mock/seed scholarships and related applications."""
+    if current_user.role != 'admin':
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        import sqlite3
+        import os
+        db_path = os.path.join(current_app.instance_path, 'scholarsphere.db')
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # Find mock scholarships inserted by seed script
+        cursor.execute("SELECT id FROM scholarships WHERE code = 'SCH-001' OR title LIKE 'Academic Excellence%'")
+        ids = [row[0] for row in cursor.fetchall()]
+        removed_apps = 0
+        removed_sch = 0
+        if ids:
+            # Delete related applications first
+            cursor.execute(f"DELETE FROM scholarship_applications WHERE scholarship_id IN ({','.join('?'*len(ids))})", ids)
+            removed_apps = cursor.rowcount if cursor.rowcount is not None else 0
+            # Delete scholarships
+            cursor.execute(f"DELETE FROM scholarships WHERE id IN ({','.join('?'*len(ids))})", ids)
+            removed_sch = cursor.rowcount if cursor.rowcount is not None else len(ids)
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'removed_scholarships': removed_sch, 'removed_applications': removed_apps})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @admin_bp.route('/api/create-provider', methods=['POST'])
 @login_required

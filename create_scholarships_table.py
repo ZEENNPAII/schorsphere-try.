@@ -31,24 +31,7 @@ def main():
         """
     )
 
-    # Seed one example if table empty
-    cur.execute("SELECT COUNT(*) FROM scholarships")
-    if cur.fetchone()[0] == 0:
-        # Try to find a provider user
-        cur.execute("SELECT id, organization FROM users WHERE role='provider' ORDER BY id ASC LIMIT 1")
-        row = cur.fetchone()
-        provider_id = row[0] if row else 1
-        cur.execute(
-            "INSERT OR IGNORE INTO scholarships (code, title, provider_id, status, applications_count, created_at) VALUES (?,?,?,?,?,?)",
-            (
-                'SCH-001',
-                'Academic Excellence Scholarship',
-                provider_id,
-                'approved',
-                45,
-                datetime.utcnow().isoformat(),
-            ),
-        )
+    # Do not seed mock scholarship data here to avoid polluting production database
     conn.commit()
     conn.close()
     print('Scholarships table ensured')

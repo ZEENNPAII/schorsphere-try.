@@ -139,9 +139,44 @@ class ScholarshipApplication(db.Model):
     # Ensure one user can only apply once per scholarship
     __table_args__ = (db.UniqueConstraint('user_id', 'scholarship_id', name='unique_user_scholarship'),)
 
+# Notification model for student interactions
+class Notification(db.Model):
+    __tablename__ = 'notifications'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    type = db.Column(db.String(50), nullable=False)  # e.g., 'approved', 'schedule', 'update', 'deadline', 'info'
+    title = db.Column(db.String(255), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    read_at = db.Column(db.DateTime, nullable=True)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+
+    # Relationship
+    user = db.relationship('User', backref='notifications')
+
+# Schedule model (belongs to one provider and one student; can link to an application)
+class Schedule(db.Model):
+    __tablename__ = 'schedule'
+
+    id = db.Column(db.Integer, primary_key=True)
+    application_id = db.Column(db.Integer, db.ForeignKey('scholarship_applications.id'), nullable=False)
+    provider_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)  # student
+    schedule_date = db.Column(db.Date, nullable=True)
+    schedule_time = db.Column(db.String(10), nullable=True)  # HH:MM
+    location = db.Column(db.String(255))
+    notes = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    # Relationships
+    application = db.relationship('ScholarshipApplication', backref='schedules')
+    provider = db.relationship('User', foreign_keys=[provider_id], backref='provider_schedules')
+    student = db.relationship('User', foreign_keys=[user_id], backref='student_schedules')
+
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
 # Routes
 @app.route('/')
