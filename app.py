@@ -30,6 +30,12 @@ else:
     # Vercel/cloud databases often use postgres:// but SQLAlchemy needs postgresql://
     if database_url.startswith('postgres://'):
         database_url = database_url.replace('postgres://', 'postgresql://', 1)
+    
+    # For Supabase: If using port 5432, suggest using pooler port 6543
+    # But don't auto-change it - let user configure it correctly
+    if 'supabase.co:5432' in database_url and 'pgbouncer' not in database_url:
+        print("WARNING: Consider using Supabase connection pooler (port 6543) for serverless functions")
+        print("Current connection uses direct port 5432. For Vercel, use port 6543 with ?pgbouncer=true")
 
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
